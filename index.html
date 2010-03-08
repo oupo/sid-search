@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="Content-Script-Type" content="text/javascript">
+<meta http-equiv="Content-Style-Type" content="text/css">
+<title>くじ番号から裏ID検索</title>
+<script type="text/javascript" src="jquery.js"></script>
+<script type="text/javascript">
+$(function() {
+	$(document.forms.f).submit(on_submit);
+	$("#stop-button").click(on_click_stop_button);
+	initialize_stop_button();
+});
+
+var loop_abort = null;
+var resume = null;
+var time_stop_timer = null; // タイマーがセットされてから停止が押されるまでの時間
+
+var WAIT_MSEC = 1000;
+
+function on_click_stop_button() {
+	if (loop_abort !== null) {
+		loop_abort();
+		loop_abort = null;
+		change_button_text_to_resume();
+		$("#progress").append(" (停止中)");
+		return;
+	}
+	if (resume) {
+		var msec = time_stop_timer != null ? Math.max(WAIT_MSEC - time_stop_timer, 0) : 0;
+		setTimeout(function() {
+			enable_button();
+			resume();
+		}, msec);
+	}
+}
+
+function on_submit() {
+	if (loop_abort) {
+		loop_abort();
+		loop_abort = null;
+	}
+	var f = this;
+	var kujiids = read_kuji_ids(f.kujiids.value);
+	if (kujiids === null) {
+		alert("くじIDが無効な値です");
+		return;
+	}
+	var tid = read_int_string(f.tid.value);
+	if (tid === null) {
+		alert("表IDが無効な値です");
+		return;
+	}
+	var search_max = read_int_string(f.search_max.value);
+	if (search_max === null) {
+		alert("検索回数が無効な値です");
+		return;
+	}
+	
+	clear_out();
+	var seed = search_higawari_seed(kujiids);
+	if (seed === null) {
+		print("くじ番号に対応するseedが見つかりません");
+		return;
+	}
+	print("日替わり乱数のseed: "+format_hex(seed, 8));
+	var count = 1;
+	seed = prev_higawari_seed(prev_higawari_seed(seed));
+	var found_count = 0;
+	resume = loop;
+	enable_button();
+	loop();
+	
+	function loop() {
+		time_stop_timer = null;
+		$("#progress").text(count+"回前からの結果をサーバーから待っています");
+		var xhr = request_to_server(seed, tid, search_max - (count - 1), function(data) {
+			var response = parse_response(data);
+			for (var i = 0; i < response.result.length; i ++) {
+				var r = response.result[i];
+				print((count+r.i)+"回前 ゲーム開始時の初期seed: "+format_hex(r.seed, 8)+", 裏ID: "+format_dec(r.sid, 5));
+				found_count ++;
+			}
+			count += response.count;
+			seed = response.next_seed;
+			if (count >= search_max) {
+				$("#progress").text("完了 ("+(count-1)+"回前まで検索し"+
+				                    (found_count === 0 ? "見つかりませんでした" : found_count+"個見つかりました")+")");
+				$("#progress").append('<br><input type="button" value="もっと探す">');
+				$("#progress input").click(function() {
+					search_max += 2000;
+					resume = loop;
+					enable_button();
+					loop();
+				});
+				at_finish_search();
+			} else {
+				$("#progress").text((count-1)+"回前まで検索しました");
+				var time = + new Date;
+				var timer_id = setTimeout(loop, WAIT_MSEC);
+				loop_abort = function() {
+					time_stop_timer = new Date - time;
+					clearTimeout(timer_id);
+				};
+			}
+		}, function(xhr) {
+			$("#progress").text("エラー HTTPステータス: "+xhr.status);
+			at_finish_search();
+		});
+		loop_abort = function() { xhr.abort(); xhr = null; };
+	}
+}
+
+function initialize_stop_button() {
+	$("#stop-button").val("停止").attr("disabled", true);
+}
+
+function enable_button() {
+	$("#stop-button").val("停止").attr("disabled", false);
+}
+
+function change_button_text_to_resume() {
+	$("#stop-button").val("再開").attr("disabled", false);
+}
+
+function at_finish_search() {
+	loop_abort = null;
+	resume = null;
+	time_on_settimer = null;
+	initialize_stop_button();
+}
+
+function request_to_server(seed, tid, search_max, success, error) {
+	var url = "sid-search.cgi?seed="+format_hex(seed, 8).slice(2)+"&tid="+format_hex(tid, 4).slice(2)+"&search_max="+search_max;
+	return $.ajax({dataType: "text", url: url, success: success, error: error});
+}
+
+/*
+// ダミーの結果を返す
+function request_to_server(seed, tid, search_max, success, error) {
+	var id = setTimeout(function() {
+		search_max = Math.min(search_max, 100);
+		for (var i = 0; i < search_max; i ++) { seed = prev_higawari_seed(seed); }
+		success("result:\nnext:"+search_max+" "+format_hex(seed, 8).slice(2)+"\n");
+	}, 1000);
+	return {abort: function() {clearInterval(id)}};
+}
+*/
+
+function parse_response(text) {
+	var lines = split(text, "\n");
+	var hash = {};
+	for (var i = 0; i < lines.length; i ++) {
+		var m = /^(\w+):(.*)$/.exec(lines[i]);
+		hash[m[1]] = m[2];
+	}
+	var result = map(split(hash["result"], ","), function(e) {
+		var m = /^(\d+) ([0-9a-f]+) ([0-9a-f]+)$/.exec(e);
+		var i = Number(m[1]);
+		var seed = parseInt(m[2], 16);
+		var sid = parseInt(m[3], 16);
+		return {i: i, seed: seed, sid: sid};
+	});
+	var m = /^(\d+) ([0-9a-f]+)$/.exec(hash["next"]);
+	var count = Number(m[1]);
+	var next_seed = parseInt(m[2], 16);
+	return {result: result, count: count, next_seed: next_seed};
+}
+
+function split(s, delim) {
+	var a = s.split(delim);
+	if (a[a.length - 1] === "") a.pop();
+	return a;
+}
+
+function clear_out() {
+	$("#output").empty();
+}
+
+function print(s) {
+	$("#output").append(document.createTextNode(s));
+	$("#output").append("<br>");
+}
+
+function search_higawari_seed(kujiids) {
+	for (var i = 0; i < 65536; i ++) {
+		var kujiseed = (kujiids[0] << 16 | i) >>> 0;
+		var fseed = kuji_seed_to_higawari_seed(kujiseed);
+		var seed = fseed;
+		for (var j = 1; j < kujiids.length; j ++) {
+			seed = next_higawari_seed(seed);
+			var id = higawari_seed_to_kuji_seed(seed) >>> 16;
+			if (kujiids[j] !== id) break;
+		}
+		if (j === kujiids.length) return fseed;
+	}
+	return null;
+}
+
+function higawari_seed_to_kuji_seed(seed) {
+	return mul(seed, 0x41c64e6d) + 0x3039 >>> 0;
+}
+
+function kuji_seed_to_higawari_seed(seed) {
+	return mul(seed, 0xeeb9eb65) + 0xfc77a683 >>> 0;
+}
+
+function next_higawari_seed(seed) {
+	return mul(seed, 0x6c078965) + 1 >>> 0;
+}
+
+function prev_higawari_seed(seed) {
+	return mul(seed, 0x9638806d) + 0x69c77f93 >>> 0;
+}
+
+function mul(a, b) {
+	var a1 = a >>> 16, a2 = a & 0xffff;
+	var b1 = b >>> 16, b2 = b & 0xffff;
+	return (((a1 * b2 + a2 * b1) << 16) + a2 * b2) >>> 0;
+}
+
+function read_kuji_ids(s) {
+	if (!/^\s*\d+(?:(?:\s*,\s*|\s+)\d+)+\s*$/.test(s)) { // スペースかカンマ区切り
+		return null;
+	}
+	var ids = map(s.match(/\d+/g), Number);
+	if (ids.length !== 3) return null;
+	return ids;
+}
+
+function map(array, fn) {
+	var len = array.length;
+	var result = new Array(len);
+	for (var i = 0; i < len; i ++) {
+		result[i] = fn(array[i]);
+	}
+	return result;
+}
+
+function read_int_string(s) {
+	if (!/^\s*(?:-?\d+|0x[0-9a-f]+)\s*$/i.test(s)) {
+		return null;
+	}
+	return Number(s);
+}
+
+function format_hex(n, prec) {
+	var s = n.toString(16);
+	return "0x" + (str_repeat("0", prec - s.length) + s);
+}
+
+function format_dec(n, prec, c) {
+	var s = String(n);
+	return (str_repeat(c || "0", prec - s.length) + s);
+}
+
+function str_repeat(s, n) {
+	var r = "";
+	for (var i = 0; i < n; i ++) {
+		r += s;
+	}
+	return r;
+}
+</script>
+<style type="text/css">
+th {
+	text-align: right;
+}
+</style>
+</head>
+<body>
+<h1>くじ番号から裏ID検索</h1>
+<ul>
+<li>ゲームを最初から開始して最初に日付を跨ぐまでの間のくじ番号は入力しないでください
+<li>入力内容はサーバーに送信され、検索はサーバー側で行われます
+<li>「○回前」というのは日付を跨いだ回数です。時刻を23:59に合わせて1日1回のイベントを行うってことをよくやっている人はその分実際の経過日数より多くなります
+<li>thanks: <a href="http://blog.livedoor.jp/ktxad/archives/1199800.html">ktxadのブログ : 日替わりの乱数 - livedoor Blog（ブログ）</a>
+</ul>
+<noscript><p>このツールを利用するにはJavaScriptを有効にする必要があります</p></noscript>
+<form action="" name="f" onsubmit="return false;">
+<table>
+<tbody>
+<tr><th>連続した3つのくじ番号: <td>
+<input type="text" size="25" name="kujiids" value=""> (半角スペース or カンマ区切り)
+<tr><th>表ID: <td>
+<input type="text" size="10" name="tid" value="">
+<tr><th>検索回数: <td>
+<input type="text" size="10" name="search_max" value="2000"> 回前まで
+<tr><td><td><input type="submit" value="検索">
+<input type="button" id="stop-button" value="停止" disabled>
+</tbody>
+</table>
+</form>
+<div id="output"></div>
+<div id="progress"></div>
+</body>
+</html>
