@@ -191,14 +191,12 @@ static void gen_cache(void) {
 }
 
 int main(void) {
-if (FALSE) {
 	printf("phase 1\n");
 	write_result();
 	printf("phase 2\n");
 	prepare_sort();
 	printf("phase 3\n");
 	merge_sort();
-}
 	printf("phase 4\n");
 	remove_rand0();
 	printf("phase 5\n");
